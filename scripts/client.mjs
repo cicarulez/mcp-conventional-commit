@@ -6,7 +6,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 
 function parseArgs(argv) {
-  const opts = { staged: true, json: false, help: false, dryRun: false };
+  const opts = { staged: true, json: false, help: false, dryRun: false, confirmCommit: false };
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -67,6 +67,12 @@ function parseArgs(argv) {
 
     if (arg === '--dry-run') {
       opts.dryRun = true;
+      continue;
+    }
+
+    if (arg === '--confirm-commit') {
+      opts.confirmCommit = true;
+      continue;
     }
   }
 
@@ -83,10 +89,11 @@ Analyze phase options:
   --max-chars <n>        Max diff characters to analyze
 
 Execute phase options:
-  --commit-message <msg> Execute commit phase with this message
+  --commit-message <msg> Prepare commit flow with this draft message
   --commit-body <body>   Optional commit body (second -m)
   --commit-footer <ftr>  Optional commit footer (third -m)
-  --dry-run              Use git commit --dry-run
+  --dry-run              Use git commit --dry-run (with --confirm-commit)
+  --confirm-commit       Actually run execute_commit after preview
 
 General:
   --json                 Print full structured JSON output
@@ -126,18 +133,8 @@ async function main() {
     await client.connect(transport);
 
     const isExecute = typeof options.commitMessage === 'string' && options.commitMessage.length > 0;
-    const response = isExecute
-      ? await client.callTool({
-          name: 'execute_commit',
-          arguments: {
-            repoPath: options.repoPath,
-            message: options.commitMessage,
-            body: options.commitBody,
-            footer: options.commitFooter,
-            dryRun: options.dryRun
-          }
-        })
-      : await client.callTool({
+    if (!isExecute) {
+      const response = await client.callTool({
           name: 'analyze_diff',
           arguments: {
             repoPath: options.repoPath,
@@ -147,11 +144,116 @@ async function main() {
           }
         });
 
-    if (options.json) {
-      console.log(JSON.stringify(response, null, 2));
+      if (options.json) {
+        console.log(JSON.stringify(response, null, 2));
+        return;
+      }
+
+      const content = Array.isArray(response.content) ? response.content : [];
+      const textOutput = content
+        .filter((item) => item.type === 'text')
+        .map((item) => item.text)
+        .join('\n')
+        .trim();
+
+      if (textOutput) {
+        console.log(textOutput);
+      } else {
+        console.log(JSON.stringify(response, null, 2));
+      }
       return;
     }
 
+    const analyzeResponse = await client.callTool({
+      name: 'analyze_diff',
+      arguments: {
+        repoPath: options.repoPath,
+        staged: options.staged,
+        baseRef: options.baseRef,
+        maxChars: options.maxChars
+      }
+    });
+    const analyzeStructured = analyzeResponse?.structuredContent ?? {};
+    const relatedRecentCommits = Array.isArray(analyzeStructured.relatedRecentCommits) ? analyzeStructured.relatedRecentCommits : [];
+    const validateResponse = await client.callTool({
+      name: 'validate_tone',
+      arguments: {
+        repoPath: options.repoPath,
+        message: options.commitMessage,
+        relatedRecentCommits
+      }
+    });
+    const validateStructured = validateResponse?.structuredContent ?? {};
+    const suggestedRewrite = typeof validateStructured.suggestedRewrite === 'string' ? validateStructured.suggestedRewrite : options.commitMessage;
+    const applied = Boolean(validateStructured.applied);
+    const finalMessage = applied ? suggestedRewrite : options.commitMessage;
+
+    let executeResponse = null;
+    if (options.confirmCommit) {
+      executeResponse = await client.callTool({
+        name: 'execute_commit',
+        arguments: {
+          repoPath: options.repoPath,
+          message: finalMessage,
+          body: options.commitBody,
+          footer: options.commitFooter,
+          dryRun: options.dryRun
+        }
+      });
+    }
+
+    if (options.json) {
+      console.log(
+        JSON.stringify(
+          {
+            analyze: analyzeResponse,
+            validateTone: validateResponse,
+            preview: {
+              originalMessage: options.commitMessage,
+              finalMessage,
+              rewritten: applied,
+              canExecute: true,
+              executed: Boolean(executeResponse),
+              confirmationRequired: !options.confirmCommit
+            },
+            execute: executeResponse
+          },
+          null,
+          2
+        )
+      );
+      return;
+    }
+
+    const toneScore = typeof validateStructured.toneScore === 'number' ? validateStructured.toneScore : null;
+    const violations = Array.isArray(validateStructured.violations) ? validateStructured.violations : [];
+    const analysisSummary = Array.isArray(analyzeResponse?.content)
+      ? analyzeResponse.content.filter((item) => item.type === 'text').map((item) => item.text).join('\n').trim()
+      : '';
+
+    if (analysisSummary) {
+      console.log(analysisSummary);
+      console.log('');
+    }
+
+    console.log('Commit message preview:');
+    console.log(`- original: ${options.commitMessage}`);
+    console.log(`- final:    ${finalMessage}`);
+    console.log(`- rewritten: ${applied ? 'yes' : 'no'}`);
+    if (toneScore !== null) {
+      console.log(`- toneScore: ${toneScore}`);
+    }
+    if (violations.length > 0) {
+      console.log(`- violations: ${violations.join('; ')}`);
+    }
+
+    if (!options.confirmCommit) {
+      console.log('');
+      console.log('No commit executed. Re-run with --confirm-commit to execute this message.');
+      return;
+    }
+
+    const response = executeResponse ?? {};
     const content = Array.isArray(response.content) ? response.content : [];
     const textOutput = content
       .filter((item) => item.type === 'text')
